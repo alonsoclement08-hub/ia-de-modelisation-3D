@@ -194,11 +194,45 @@ class OnshapeAgent:
                 f"validation (Entrée) -> volume 3D -> finition."
             )
 
+    async def _focus_canvas(self) -> None:
+        """Redonne le focus DOM et clavier au canvas 3D avant un raccourci.
+
+        CORRECTIF issu du test réel : les captures de contrôle ont montré
+        des cas où une lettre seule ('d') ne déclenchait pas l'outil
+        correspondant — juste une sélection au clic, comme si la frappe
+        n'atteignait jamais le canvas. Un `<canvas>` n'est pas focusable
+        par défaut en HTML (pas de tabindex), donc un simple clic dessus
+        ne garantit pas que le focus clavier quitte réellement le panneau
+        de propriétés ouvert par l'action précédente. On force le focus
+        DOM explicitement en plus du clic.
+        """
+        box = await self._get_graphics_canvas_box()
+        center_x = box["x"] + box["width"] / 2
+        center_y = box["y"] + box["height"] / 2
+        await self.page.mouse.click(center_x, center_y)
+        await self.page.evaluate(
+            """
+            () => {
+                let best = null;
+                for (const c of document.querySelectorAll('canvas')) {
+                    const r = c.getBoundingClientRect();
+                    if (!best || r.width * r.height > best.width * best.height) best = c;
+                }
+                if (best) {
+                    if (best.tabIndex < 0) best.tabIndex = -1;
+                    best.focus();
+                }
+            }
+            """
+        )
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+
     async def _activate_tool(self, action: ActionType) -> None:
-        """Vérifie le contexte puis déclenche l'outil associé à `action`."""
+        """Vérifie le contexte, redonne le focus au canvas, puis déclenche l'outil."""
         self._assert_context(action)
         binding = TOOL_BINDINGS[action]
         if binding.shortcut:
+            await self._focus_canvas()
             await self.page.keyboard.press(binding.shortcut)
         else:
             await self._search_and_activate(binding.search_term)
@@ -224,11 +258,25 @@ class OnshapeAgent:
         Entrée comme mécanisme de validation d'esquisse (repli documenté :
         clic sur l'encoche verte). Un Escape seul, utilisé dans une
         version précédente de ce pipeline, ne fermait pas l'esquisse de
-        façon fiable — elle restait ouverte plusieurs étapes après, ce qui
-        faisait ensuite échouer la sélection de face et l'extrusion.
+        façon fiable. Un test plus récent montre qu'Entrée seul sans
+        focus explicite sur le canvas ne suffit pas non plus (le panneau
+        d'esquisse restait ouvert) : on force donc le focus avant Entrée,
+        puis on tente en repli un clic sur l'encoche verte de
+        confirmation (sélecteur best-effort, non vérifié contre le DOM
+        réel — n'échoue pas silencieusement si absent).
         """
+        await self._focus_canvas()
         await self.page.keyboard.press("Enter")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+
+        try:
+            confirm_button = self.page.get_by_role("button", name="OK", exact=False)
+            if await confirm_button.count() > 0:
+                await confirm_button.first.click(timeout=1_000)
+                await asyncio.sleep(UI_SETTLE_DELAY_S)
+        except Exception:
+            pass  # Bouton absent/introuvable : Entrée seul a peut-être déjà suffi.
+
         self.context = InterfaceContext.FEATURE_3D
         await self._snapshot("esquisse_validee")
 
@@ -408,7 +456,14 @@ class OnshapeAgent:
     # -- Étape D : cotation ------------------------------------------------
 
     async def _dimension_side(self, edge_x: float, edge_y: float, value_mm: float) -> None:
-        """Cote un élément cliqué en (edge_x, edge_y) à `value_mm`, verrouillée."""
+        """Cote un élément cliqué en (edge_x, edge_y) à `value_mm`, verrouillée.
+
+        CORRECTIF issu du test réel : une capture de contrôle a montré 'd'
+        ne pas activer l'outil Dimension (juste une sélection d'arête au
+        clic suivant, aucun champ de saisie n'apparaît). `_focus_canvas`
+        garantit que la frappe atteint bien le canvas avant d'être envoyée.
+        """
+        await self._focus_canvas()
         await self.page.keyboard.press("d")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
         await self.page.mouse.click(edge_x, edge_y)
