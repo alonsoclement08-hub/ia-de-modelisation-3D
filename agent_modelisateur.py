@@ -202,6 +202,16 @@ class OnshapeAgent:
         await asyncio.sleep(UI_SETTLE_DELAY_S)
         await self._snapshot("02_plan_top_clique")
 
+        # Sans cela, la caméra reste en vue isométrique par défaut : un
+        # rectangle "par pixels d'écran" n'y est ni carré, ni même
+        # axé horizontalement/verticalement, ce qui fait ensuite échouer
+        # la cotation et la sélection de face (clics au mauvais endroit).
+        # On réoriente donc la vue perpendiculairement au plan Top, comme
+        # le ferait un utilisateur humain avant de dessiner.
+        await self.page.keyboard.press("n")
+        await asyncio.sleep(1.0)  # L'animation de rotation de caméra est plus longue qu'un simple settle.
+        await self._snapshot("02b_vue_normale_au_plan")
+
     # -- Étape R : rectangle par le centre -----------------------------
 
     async def _draw_rectangle(self) -> None:
