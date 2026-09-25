@@ -89,6 +89,12 @@ _RE_HOLE_DIAMETER = re.compile(rf"trou\w*[^.]*?{_NUM}\s*mm|percage\w*[^.]*?{_NUM
 # "conge de 5 mm" / "arrondi de 5 mm sur les coins"
 _RE_FILLET_RADIUS = re.compile(rf"(?:conge|arrondi)\w*[^.]*?{_NUM}\s*mm")
 
+# "chanfrein de 2 mm"
+_RE_CHAMFER_DISTANCE = re.compile(rf"chanfrein\w*[^.]*?{_NUM}\s*mm")
+
+# "coque de 3 mm" / "evidement de 3 mm" / "paroi de 3 mm"
+_RE_SHELL_THICKNESS = re.compile(rf"(?:coque|evidement|paroi)\w*[^.]*?{_NUM}\s*mm")
+
 
 def extract_dimensions(normalized_text: str) -> Dimensions:
     """Extrait largeur / hauteur / profondeur d'extrusion d'un texte normalisé.
@@ -142,6 +148,18 @@ def extract_hole_diameter(normalized_text: str) -> float | None:
 def extract_fillet_radius(normalized_text: str) -> float | None:
     """Extrait le rayon de congé mentionné dans la demande (Palier 2)."""
     match = _RE_FILLET_RADIUS.search(normalized_text)
+    return _to_float(match.group(1)) if match else None
+
+
+def extract_chamfer_distance(normalized_text: str) -> float | None:
+    """Extrait la distance de chanfrein mentionnée dans la demande (Palier 3)."""
+    match = _RE_CHAMFER_DISTANCE.search(normalized_text)
+    return _to_float(match.group(1)) if match else None
+
+
+def extract_shell_thickness(normalized_text: str) -> float | None:
+    """Extrait l'épaisseur de coque mentionnée dans la demande (Palier 3)."""
+    match = _RE_SHELL_THICKNESS.search(normalized_text)
     return _to_float(match.group(1)) if match else None
 
 
@@ -213,12 +231,20 @@ class AgentChercheur:
         )
 
     def interpret_plan(self, request: str) -> CADPlan:
-        """Palier 2 : une demande combinant plusieurs opérations en une `CADPlan`.
+        """Palier 2/3 : une demande combinant plusieurs opérations en une `CADPlan`.
 
         Construit toujours une base (esquisse + rectangle + extrusion), puis
-        ajoute un trou (esquisse + cercle + extrusion enlèvement) et/ou un
-        congé si la demande les mentionne. Pour ajouter une opération,
-        ajouter son extracteur dédié et les `CADStep` correspondantes ici.
+        ajoute un trou, un congé, un chanfrein et/ou une coque si la
+        demande les mentionne — dans cet ordre, qui correspond à un
+        enchaînement CONTEXT_3D_FEATURE -> CONTEXT_FINISHING valide.
+
+        Portée assumée : Revolve/Sweep/Loft (profil+axe/chemin/profils
+        multiples) et Draft/Hole-feature/Mirror (sélection de face/point/
+        plan) ne sont PAS détectés depuis le texte libre ici — leur
+        sémantique dépend d'une géométrie que cette extraction par
+        mots-clés ne peut pas fiablement inférer. `agent_modelisateur`
+        sait les exécuter (voir `STEP_HANDLERS`) si un `CADStep` est
+        construit à la main pour ces actions.
         """
         if not request or not request.strip():
             raise InterpretationError("La demande est vide.")
@@ -252,6 +278,12 @@ class AgentChercheur:
 
         if (fillet_radius := extract_fillet_radius(normalized_text)) is not None:
             steps.append(CADStep(action=ActionType.APPLY_FILLET, params=StepParams(radius_mm=fillet_radius)))
+
+        if (chamfer_distance := extract_chamfer_distance(normalized_text)) is not None:
+            steps.append(CADStep(action=ActionType.APPLY_CHAMFER, params=StepParams(radius_mm=chamfer_distance)))
+
+        if (shell_thickness := extract_shell_thickness(normalized_text)) is not None:
+            steps.append(CADStep(action=ActionType.APPLY_SHELL, params=StepParams(thickness_mm=shell_thickness)))
 
         return CADPlan(steps=steps)
 

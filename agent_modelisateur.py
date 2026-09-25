@@ -2,22 +2,42 @@
 agent_modelisateur.py
 
 Agent Modélisateur : lit l'ordre CAO JSON produit par l'Agent Chercheur et
-le rejoue dans Onshape via Playwright, en n'utilisant que des raccourcis
-clavier natifs (aucun clic sur un menu).
+le rejoue dans Onshape via Playwright, en pilotant l'UI par raccourcis
+clavier natifs et, en repli, par la barre de recherche d'outils.
 
-Raccourcis utilisés (vérifiés contre cad.onshape.com/help) :
-    Shift+S -> nouvelle esquisse
-    R       -> rectangle par le centre
-    C       -> cercle par le centre
+Machine à états (contextes Onshape) :
+    Certaines actions ne sont valides que dans un contexte précis (on ne
+    peut pas dessiner un rectangle hors d'une esquisse active, ni
+    extruder tant qu'elle n'a pas été validée). `OnshapeAgent.context`
+    (un `schemas.InterfaceContext`) suit l'état courant ; `TOOL_BINDINGS`
+    et `CONTEXT_VALID_ACTIONS` forment la matrice raccourci/contexte, et
+    `_activate_tool` refuse (ModelisationError) toute action hors de son
+    contexte plutôt que de presser une touche au hasard. Voir ces trois
+    noms pour la matrice complète.
+
+Raccourcis vérifiés contre cad.onshape.com/help (2026-09-25) :
+    Alt+C   -> barre de recherche d'outils (fallback universel)
+    Shift+S -> nouvelle esquisse (CONTEXT_GLOBAL/FEATURE_3D -> SKETCH)
+    R / C   -> rectangle / cercle par le centre (CONTEXT_SKETCH)
     D       -> cotation -> clic sur l'élément -> saisie -> Enter
+    Entrée  -> valide et quitte l'esquisse active (CONTEXT_SKETCH -> FEATURE_3D)
     Shift+E -> extrusion (Add ou Remove selon le dialogue)
-    Shift+F -> congé (fillet)
+    Shift+W -> révolution (Revolve)
+    Shift+F -> congé (Fillet)
 
-    NOTE : la demande initiale du Palier 1 évoquait N/R/D/E pour la
-    séquence de base. 'N' seul correspond en réalité à "Normal to"
-    (orientation caméra, qu'on utilise bien, cf. `_new_sketch`) et 'E'
-    seul à la contrainte "Equal" ; les vrais raccourcis pour nouvelle
-    esquisse et extrusion sont Shift+S et Shift+E.
+    Sweep, Loft, Chamfer, Shell, Draft, Hole et Mirror N'ONT PAS de
+    raccourci clavier direct documenté dans Onshape (vérifié) : ils
+    passent systématiquement par Alt+C (recherche) + nom + Entrée, plutôt
+    que par une combinaison Shift+<lettre> devinée qui déclencherait
+    autre chose (ou rien) dans l'UI réelle.
+
+    NOTE historique : les demandes initiales évoquaient 'N'/'E' seuls
+    pour esquisse/extrusion, et Escape pour quitter l'esquisse. Vérifié
+    faux dans les deux cas : 'N' seul = "Normal to" (utilisé pour orienter
+    la caméra, cf. `_new_sketch`), 'E' seul = contrainte "Equal", et
+    Escape ne fermait pas l'esquisse de façon fiable en test réel — la
+    documentation officielle indique Entrée comme mécanisme de
+    validation, désormais utilisé par `_exit_sketch`.
 
 Stratégie de cotation (fidèle au workflow CAO classique) :
     1. On dessine la géométrie approximativement (taille en pixels, peu
@@ -29,17 +49,20 @@ Stratégie de cotation (fidèle au workflow CAO classique) :
        éviter qu'elle ne se mélange à une valeur mesurée/snappée par
        Onshape (ex: 79.70mm au lieu de 80mm) — voir `_type_exact_value`.
 
-Deux niveaux d'API cohabitent :
+Trois niveaux d'API cohabitent :
     - `execute(CADCommand)` (Palier 1) : une pièce simple en une seule
       action, via `ACTION_HANDLERS`. Conservé tel quel.
-    - `execute_plan(CADPlan)` (Palier 2) : une séquence d'étapes
-      (esquisse, rectangle/cercle, extrusion add/remove, congé...), via
-      `STEP_HANDLERS`. C'est le chemin utilisé par la CLI (`load_plan`
-      accepte aussi bien un `command.json` Palier 1 qu'un plan Palier 2).
+    - `execute_plan(CADPlan)` (Palier 2/3) : une séquence d'étapes
+      (esquisse, formes, extrusion add/remove, révolution, finitions...),
+      via `STEP_HANDLERS`. Utilisé par la CLI (`load_plan` accepte les
+      deux formats) et par `main.py` (terminal interactif).
+    - `main.py` combine les deux agents dans une boucle interactive,
+      session Onshape unique conservée entre les commandes.
 
-Pour ajouter une opération au Palier 3 : ajouter la valeur dans
-`schemas.ActionType`, écrire la méthode `_step_xxx` correspondante sur
-`OnshapeAgent`, puis l'enregistrer dans `STEP_HANDLERS`.
+Pour ajouter une opération : ajouter la valeur dans `schemas.ActionType`,
+son entrée dans `TOOL_BINDINGS`/`CONTEXT_VALID_ACTIONS`, écrire la
+méthode `_step_xxx` correspondante sur `OnshapeAgent`, puis l'enregistrer
+dans `STEP_HANDLERS`.
 """
 
 from __future__ import annotations
@@ -54,7 +77,7 @@ from typing import Awaitable, Callable, ClassVar
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
-from schemas import ActionType, CADCommand, CADPlan, CADStep, PlaneType, StepParams
+from schemas import ActionType, CADCommand, CADPlan, CADStep, InterfaceContext, PlaneType, StepParams
 
 # ---------------------------------------------------------------------------
 # Constantes de configuration
@@ -82,7 +105,74 @@ DEBUG_SCREENSHOT_DIR = Path("debug_screenshots")
 
 
 class ModelisationError(RuntimeError):
-    """Levée quand une étape de modélisation échoue dans Onshape."""
+    """Levée quand une étape de modélisation échoue dans Onshape, y compris
+    quand une action est demandée dans un contexte où elle n'est pas valide."""
+
+
+@dataclass(frozen=True)
+class ToolBinding:
+    """Comment déclencher un outil Onshape : raccourci direct si documenté,
+    sinon recherche (Alt+C -> nom -> Entrée)."""
+
+    shortcut: str | None = None
+    search_term: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.shortcut and not self.search_term:
+            raise ValueError("ToolBinding nécessite shortcut ou search_term.")
+
+
+# Matrice action -> déclenchement, vérifiée le 2026-09-25 contre
+# cad.onshape.com/help/Content/Home/keyboard_shortcuts_and_hotkeys.htm.
+# Alt+C (recherche), Shift+S (esquisse), R/C (outils d'esquisse), Shift+E
+# (extrusion), Shift+W (révolution) et Shift+F (congé) sont des raccourcis
+# documentés. Sweep, Loft, Chamfer, Shell, Draft, Hole et Mirror N'ONT PAS
+# de raccourci clavier direct documenté dans Onshape (vérifié) : on utilise
+# systématiquement le fallback recherche pour eux plutôt qu'une combinaison
+# Shift+<lettre> devinée, qui déclencherait autre chose (ou rien) dans
+# l'UI réelle.
+TOOL_BINDINGS: dict[ActionType, ToolBinding] = {
+    ActionType.CREATE_SKETCH: ToolBinding(shortcut="Shift+S"),
+    ActionType.DRAW_RECTANGLE: ToolBinding(shortcut="r"),
+    ActionType.DRAW_CIRCLE: ToolBinding(shortcut="c"),
+    ActionType.EXTRUDE_ADD: ToolBinding(shortcut="Shift+E"),
+    ActionType.EXTRUDE_REMOVE: ToolBinding(shortcut="Shift+E"),
+    ActionType.REVOLVE: ToolBinding(shortcut="Shift+W"),
+    ActionType.SWEEP: ToolBinding(search_term="Sweep"),
+    ActionType.LOFT: ToolBinding(search_term="Loft"),
+    ActionType.APPLY_FILLET: ToolBinding(shortcut="Shift+F"),
+    ActionType.APPLY_CHAMFER: ToolBinding(search_term="Chamfer"),
+    ActionType.APPLY_SHELL: ToolBinding(search_term="Shell"),
+    ActionType.APPLY_DRAFT: ToolBinding(search_term="Draft"),
+    ActionType.APPLY_HOLE_FEATURE: ToolBinding(search_term="Hole"),
+    ActionType.APPLY_MIRROR: ToolBinding(search_term="Mirror"),
+}
+
+# Actions valides par contexte (machine à états). Onshape n'a pas de mode
+# "finition" séparé dans son UI : une fois un corps 3D obtenu (FEATURE_3D),
+# les opérations de volume ET de finition sont toutes disponibles au même
+# niveau — CONTEXT_FINISHING n'est donc pas un état distinct ici, ses
+# actions sont simplement incluses dans FEATURE_3D.
+CONTEXT_VALID_ACTIONS: dict[InterfaceContext, frozenset[ActionType]] = {
+    InterfaceContext.GLOBAL: frozenset({ActionType.CREATE_SKETCH}),
+    InterfaceContext.SKETCH: frozenset({ActionType.DRAW_RECTANGLE, ActionType.DRAW_CIRCLE}),
+    InterfaceContext.FEATURE_3D: frozenset(
+        {
+            ActionType.CREATE_SKETCH,
+            ActionType.EXTRUDE_ADD,
+            ActionType.EXTRUDE_REMOVE,
+            ActionType.REVOLVE,
+            ActionType.SWEEP,
+            ActionType.LOFT,
+            ActionType.APPLY_FILLET,
+            ActionType.APPLY_CHAMFER,
+            ActionType.APPLY_SHELL,
+            ActionType.APPLY_DRAFT,
+            ActionType.APPLY_HOLE_FEATURE,
+            ActionType.APPLY_MIRROR,
+        }
+    ),
+}
 
 
 @dataclass
@@ -90,7 +180,57 @@ class OnshapeAgent:
     """Pilote une page Onshape via des raccourcis clavier pour construire une pièce."""
 
     page: Page
+    context: InterfaceContext = InterfaceContext.GLOBAL
     _step_counter: int = field(default=0, repr=False)
+
+    # -- Machine à états --------------------------------------------------
+
+    def _assert_context(self, action: ActionType) -> None:
+        allowed = CONTEXT_VALID_ACTIONS.get(self.context, frozenset())
+        if action not in allowed:
+            raise ModelisationError(
+                f"Action {action.value} invalide dans le contexte actuel "
+                f"({self.context.value}). Séquence attendue : esquisse -> "
+                f"validation (Entrée) -> volume 3D -> finition."
+            )
+
+    async def _activate_tool(self, action: ActionType) -> None:
+        """Vérifie le contexte puis déclenche l'outil associé à `action`."""
+        self._assert_context(action)
+        binding = TOOL_BINDINGS[action]
+        if binding.shortcut:
+            await self.page.keyboard.press(binding.shortcut)
+        else:
+            await self._search_and_activate(binding.search_term)
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+
+    async def _search_and_activate(self, term: str) -> None:
+        """Ouvre la barre de recherche d'outils (Alt+C), tape `term`, valide (Entrée).
+
+        Fallback générique pour tout outil sans raccourci clavier direct
+        documenté (Sweep, Loft, Chamfer, Shell, Draft, Hole, Mirror...).
+        """
+        await self.page.keyboard.press("Alt+C")
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self.page.keyboard.type(term)
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self.page.keyboard.press("Enter")
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+
+    async def _exit_sketch(self) -> None:
+        """Valide et quitte l'esquisse active, puis passe le contexte à FEATURE_3D.
+
+        CORRECTIF issu du test réel : la documentation Onshape indique
+        Entrée comme mécanisme de validation d'esquisse (repli documenté :
+        clic sur l'encoche verte). Un Escape seul, utilisé dans une
+        version précédente de ce pipeline, ne fermait pas l'esquisse de
+        façon fiable — elle restait ouverte plusieurs étapes après, ce qui
+        faisait ensuite échouer la sélection de face et l'extrusion.
+        """
+        await self.page.keyboard.press("Enter")
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        self.context = InterfaceContext.FEATURE_3D
+        await self._snapshot("esquisse_validee")
 
     async def _snapshot(self, step_name: str) -> None:
         """Capture un instantané après une étape, pour vérifier visuellement son effet réel."""
@@ -188,18 +328,22 @@ class OnshapeAgent:
         # Certains flux affichent un formulaire de connexion sans changer d'URL.
         return await self.page.locator("input[type='password']").count() > 0
 
-    # -- Étape N : nouvelle esquisse -----------------------------------
+    # -- CONTEXT_GLOBAL -> CONTEXT_SKETCH : nouvelle esquisse --------------
 
     async def _new_sketch(self, plane: PlaneType) -> None:
         if plane is not PlaneType.TOP:
-            # Palier 1 ne gère que le plan Top ; les autres plans sont
+            # Palier 1/2 ne gère que le plan Top ; les autres plans sont
             # prévus dans le schéma mais pas encore pilotables ici.
             raise ModelisationError(
-                f"Plan '{plane.value}' non encore supporté par l'Agent Modélisateur (Palier 1)."
+                f"Plan '{plane.value}' non encore supporté par l'Agent Modélisateur."
             )
 
-        await self.page.keyboard.press("Shift+S")
-        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        # Une esquisse déjà ouverte (nested) est validée avant d'en ouvrir
+        # une nouvelle : Shift+S n'est valide qu'en GLOBAL ou FEATURE_3D.
+        if self.context is InterfaceContext.SKETCH:
+            await self._exit_sketch()
+
+        await self._activate_tool(ActionType.CREATE_SKETCH)
         await self._snapshot("01_apres_shift_s")
 
         # Après Shift+S, Onshape attend la sélection d'un plan de construction.
@@ -221,11 +365,12 @@ class OnshapeAgent:
         await asyncio.sleep(1.0)  # L'animation de rotation de caméra est plus longue qu'un simple settle.
         await self._snapshot("02b_vue_normale_au_plan")
 
-    # -- Étape R : rectangle par le centre -----------------------------
+        self.context = InterfaceContext.SKETCH
+
+    # -- CONTEXT_SKETCH : rectangle par le centre --------------------------
 
     async def _draw_rectangle(self) -> None:
-        await self.page.keyboard.press("r")
-        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._activate_tool(ActionType.DRAW_RECTANGLE)
 
         box = await self._get_graphics_canvas_box()
         center_x = box["x"] + box["width"] / 2
@@ -294,11 +439,10 @@ class OnshapeAgent:
         await asyncio.sleep(UI_SETTLE_DELAY_S)
         await self._snapshot("04_cotation_terminee")
 
-    # -- Étape C : cercle par le centre (Palier 2, perçages) ----------------
+    # -- CONTEXT_SKETCH : cercle par le centre (perçages) -------------------
 
     async def _draw_circle(self) -> None:
-        await self.page.keyboard.press("c")
-        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._activate_tool(ActionType.DRAW_CIRCLE)
 
         box = await self._get_graphics_canvas_box()
         center_x = box["x"] + box["width"] / 2
@@ -332,12 +476,12 @@ class OnshapeAgent:
         await asyncio.sleep(UI_SETTLE_DELAY_S)
         await self._snapshot("cercle_cote")
 
-    # -- Étape Shift+E : extrusion (ajout ou enlèvement de matière) --------
+    # -- CONTEXT_SKETCH -> CONTEXT_3D_FEATURE : extrusion (add/remove) -----
 
     async def _extrude(self, *, depth_mm: float | None, remove: bool, through_all: bool) -> None:
-        # Termine l'esquisse avant de pouvoir en extruder la face.
-        await self.page.keyboard.press("Escape")
-        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        # Valide et quitte l'esquisse (Entrée) avant de pouvoir extruder sa face.
+        if self.context is InterfaceContext.SKETCH:
+            await self._exit_sketch()
 
         box = await self._get_graphics_canvas_box()
         center_x = box["x"] + box["width"] / 2
@@ -348,8 +492,8 @@ class OnshapeAgent:
         await asyncio.sleep(UI_SETTLE_DELAY_S)
         await self._snapshot("face_selectionnee")
 
-        await self.page.keyboard.press("Shift+E")
-        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        action = ActionType.EXTRUDE_REMOVE if remove else ActionType.EXTRUDE_ADD
+        await self._activate_tool(action)
         await self._snapshot("dialogue_extrusion")
 
         if remove:
@@ -392,8 +536,7 @@ class OnshapeAgent:
         n'a pas pu être validée en conditions réelles ; à ajuster lors du
         premier test, comme le reste du pipeline de cotation/sélection.
         """
-        await self.page.keyboard.press("Shift+F")
-        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._activate_tool(ActionType.APPLY_FILLET)
         await self._snapshot("outil_fillet_actif")
 
         box = await self._get_graphics_canvas_box()
@@ -414,6 +557,93 @@ class OnshapeAgent:
         await self.page.keyboard.press("Enter")  # Verrouille le rayon à la valeur exacte tapée.
         await asyncio.sleep(UI_SETTLE_DELAY_S)
         await self._snapshot("fillet_valide")
+
+    # -- CONTEXT_3D_FEATURE : révolution, balayage, loft --------------------
+
+    async def _revolve(self, angle_deg: float | None) -> None:
+        """Révolution du profil d'esquisse autour d'un axe.
+
+        NON VÉRIFIÉ CONTRE L'APP RÉELLE, et INCOMPLET PAR CONSTRUCTION : ce
+        pipeline ne sait pas encore tracer de ligne de construction ('Q')
+        à utiliser comme axe de révolution. Ne sélectionne que le profil
+        (convention du reste du pipeline : clic au centre du canvas) puis
+        déclenche l'outil ; la sélection de l'axe reste à la charge de
+        l'utilisateur dans Onshape tant qu'un outil DRAW_LINE + axe de
+        construction n'est pas implémenté côté Chercheur/Modélisateur.
+        """
+        if self.context is InterfaceContext.SKETCH:
+            await self._exit_sketch()
+
+        box = await self._get_graphics_canvas_box()
+        center_x = box["x"] + box["width"] / 2
+        center_y = box["y"] + box["height"] / 2
+        await self.page.mouse.click(center_x, center_y)  # Sélectionne le profil.
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("profil_selectionne")
+
+        await self._activate_tool(ActionType.REVOLVE)
+        await self._snapshot("dialogue_revolve")
+
+        if angle_deg is not None:
+            await self._type_exact_value(angle_deg)
+            await self.page.keyboard.press("Enter")
+            await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("revolve_valide")
+
+    async def _sweep(self) -> None:
+        """Ouvre l'outil Sweep (recherche Alt+C, aucun raccourci direct documenté).
+
+        NON IMPLÉMENTÉ AU-DELÀ DE L'ACTIVATION DE L'OUTIL : Sweep nécessite
+        un profil ET un chemin, deux sélections distinctes que ce pipeline
+        ne sait pas construire (pas de tracé de chemin 3D). L'outil
+        s'ouvre pour que l'utilisateur termine la sélection manuellement.
+        """
+        if self.context is InterfaceContext.SKETCH:
+            await self._exit_sketch()
+        await self._activate_tool(ActionType.SWEEP)
+        await self._snapshot("dialogue_sweep_ouvert")
+
+    async def _loft(self) -> None:
+        """Ouvre l'outil Loft (recherche Alt+C, aucun raccourci direct documenté).
+
+        NON IMPLÉMENTÉ AU-DELÀ DE L'ACTIVATION DE L'OUTIL : Loft nécessite
+        plusieurs profils sur des esquisses/plans distincts, que ce
+        pipeline ne sait pas encore préparer. L'outil s'ouvre pour une
+        sélection manuelle par l'utilisateur.
+        """
+        if self.context is InterfaceContext.SKETCH:
+            await self._exit_sketch()
+        await self._activate_tool(ActionType.LOFT)
+        await self._snapshot("dialogue_loft_ouvert")
+
+    # -- CONTEXT_FINISHING : congé, chanfrein, coque, dépouille, perçage, symétrie
+
+    async def _run_finishing_op(self, action: ActionType, value: float | None) -> None:
+        """Sélectionne la géométrie courante, déclenche l'outil, tape la
+        valeur unique si fournie, valide.
+
+        NON VÉRIFIÉ CONTRE L'APP RÉELLE. Le clic au centre du canvas comme
+        sélection est une approximation raisonnable pour Chamfer
+        (arête/face) et Shell (face), mais probablement INSUFFISANTE pour
+        Hole (nécessite un point/sommet) et Mirror (nécessite un plan de
+        symétrie) : ces deux-là sont câblés dans la matrice de contexte
+        pour compléter l'architecture demandée, mais leur logique de
+        sélection reste à construire lors d'un test réel.
+        """
+        box = await self._get_graphics_canvas_box()
+        center_x = box["x"] + box["width"] / 2
+        center_y = box["y"] + box["height"] / 2
+        await self.page.mouse.click(center_x, center_y)
+        await asyncio.sleep(UI_SETTLE_DELAY_S)
+
+        await self._activate_tool(action)
+        await self._snapshot(f"{action.value.lower()}_outil_actif")
+
+        if value is not None:
+            await self._type_exact_value(value)
+            await self.page.keyboard.press("Enter")
+            await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot(f"{action.value.lower()}_valide")
 
     # -- Dispatch Palier 1 (CADCommand) -------------------------------------
 
@@ -472,15 +702,55 @@ class OnshapeAgent:
             raise ModelisationError("APPLY_FILLET nécessite radius_mm.")
         await self._apply_fillet(params.radius_mm)
 
-    # Registre action -> handler d'étape. Palier 3 : ajouter la nouvelle
-    # valeur dans schemas.ActionType, écrire _step_xxx, puis l'enregistrer ici.
+    async def _step_revolve(self, step: CADStep) -> None:
+        await self._revolve(step.params.angle_deg)
+
+    async def _step_sweep(self, step: CADStep) -> None:
+        await self._sweep()
+
+    async def _step_loft(self, step: CADStep) -> None:
+        await self._loft()
+
+    async def _step_apply_chamfer(self, step: CADStep) -> None:
+        if step.params.radius_mm is None:
+            raise ModelisationError("APPLY_CHAMFER nécessite radius_mm.")
+        await self._run_finishing_op(ActionType.APPLY_CHAMFER, step.params.radius_mm)
+
+    async def _step_apply_shell(self, step: CADStep) -> None:
+        if step.params.thickness_mm is None:
+            raise ModelisationError("APPLY_SHELL nécessite thickness_mm.")
+        await self._run_finishing_op(ActionType.APPLY_SHELL, step.params.thickness_mm)
+
+    async def _step_apply_draft(self, step: CADStep) -> None:
+        if step.params.angle_deg is None:
+            raise ModelisationError("APPLY_DRAFT nécessite angle_deg.")
+        await self._run_finishing_op(ActionType.APPLY_DRAFT, step.params.angle_deg)
+
+    async def _step_apply_hole_feature(self, step: CADStep) -> None:
+        await self._run_finishing_op(ActionType.APPLY_HOLE_FEATURE, step.params.diameter_mm)
+
+    async def _step_apply_mirror(self, step: CADStep) -> None:
+        await self._run_finishing_op(ActionType.APPLY_MIRROR, None)
+
+    # Registre action -> handler d'étape. Palier 4 : ajouter la nouvelle
+    # valeur dans schemas.ActionType, l'entrée correspondante dans
+    # TOOL_BINDINGS/CONTEXT_VALID_ACTIONS, écrire _step_xxx, puis
+    # l'enregistrer ici.
     STEP_HANDLERS: ClassVar[dict[ActionType, Callable[["OnshapeAgent", CADStep], Awaitable[None]]]] = {
         ActionType.CREATE_SKETCH: _step_create_sketch,
         ActionType.DRAW_RECTANGLE: _step_draw_rectangle,
         ActionType.DRAW_CIRCLE: _step_draw_circle,
         ActionType.EXTRUDE_ADD: _step_extrude_add,
         ActionType.EXTRUDE_REMOVE: _step_extrude_remove,
+        ActionType.REVOLVE: _step_revolve,
+        ActionType.SWEEP: _step_sweep,
+        ActionType.LOFT: _step_loft,
         ActionType.APPLY_FILLET: _step_apply_fillet,
+        ActionType.APPLY_CHAMFER: _step_apply_chamfer,
+        ActionType.APPLY_SHELL: _step_apply_shell,
+        ActionType.APPLY_DRAFT: _step_apply_draft,
+        ActionType.APPLY_HOLE_FEATURE: _step_apply_hole_feature,
+        ActionType.APPLY_MIRROR: _step_apply_mirror,
     }
 
     async def execute_plan(self, plan: CADPlan) -> None:
