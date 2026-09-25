@@ -101,13 +101,20 @@ class OnshapeAgent:
 
         await self._dismiss_overlays()
 
-        # Le <canvas> existe très tôt dans le DOM mais reste caché tant que
-        # la vue graphique n'a pas fini son initialisation. Onshape le
-        # signale via l'attribut data-view-shown="true" sur ce <canvas> ;
-        # attendre juste sa "visibilité" (comme avant) est insuffisant et
-        # provoque un timeout même quand la page charge normalement.
+        # Le <canvas> existe très tôt dans le DOM mais reste caché (bounding
+        # box nulle) tant que la vue graphique n'a pas fini son
+        # initialisation. L'attribut data-view-shown, lui, ne passe pas
+        # forcément à "true" de façon fiable : on se base plutôt sur la
+        # taille réellement rendue à l'écran, seul signal garanti.
         await self.page.wait_for_function(
-            "document.querySelector('canvas')?.getAttribute('data-view-shown') === 'true'",
+            """
+            () => {
+                const c = document.querySelector('canvas');
+                if (!c) return false;
+                const r = c.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }
+            """,
             timeout=90_000,
         )
         await self.page.locator("canvas").first.click()
