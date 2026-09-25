@@ -622,28 +622,79 @@ class OnshapeAgent:
 
     # -- CONTEXT_SKETCH -> CONTEXT_3D_FEATURE : extrusion (add/remove) -----
 
+    async def _click_sketch_face(self, extra_instruction: str = "") -> None:
+        """Clique sur la face/région fermée de l'esquisse, localisée par vision.
+
+        CORRECTIF issu du test réel : une capture a montré le champ de
+        sélection de l'Extrude vide malgré le clic. L'outil "rectangle
+        par le centre" laisse un petit repère en forme de cercle-dans-
+        cercle exactement au centre de l'esquisse (son point de
+        référence) ; cliquer PILE dessus sélectionne ce point, pas la
+        face qui l'entoure — d'où une sélection vide. Le prompt évite
+        maintenant explicitement ce repère.
+        """
+        box = await self._get_graphics_canvas_box()
+        center_x = box["x"] + box["width"] / 2
+        center_y = box["y"] + box["height"] / 2
+        await self._click_by_vision(
+            "un point à l'INTÉRIEUR de la zone grisée de l'esquisse fermée "
+            "(le rectangle ou le cercle dessiné), pour la sélectionner comme "
+            "face à extruder. IMPORTANT : ne pas viser le petit repère en "
+            "forme de cercle-dans-cercle au centre de la forme (c'est un "
+            "point de référence, pas la face) — viser un point nettement "
+            "décalé de ce repère, par exemple à mi-chemin entre le centre "
+            "et un coin de la forme. Ne pas cliquer sur un plan de "
+            "référence Top/Front/Right." + extra_instruction,
+            (center_x, center_y),
+        )
+
+    async def _extrude_selection_is_empty(self) -> bool:
+        """Vérifie par vision si le dialogue Extrude n'a encore rien sélectionné.
+
+        Retourne True si le champ "Faces and sketch regions to extrude"
+        affiche toujours son texte de substitution (vide). Retourne False
+        (pas d'alerte) si la vision n'est pas configurée : mieux vaut ne
+        pas bloquer le pipeline que de deviner à tort.
+        """
+        if self._vision is None:
+            return False
+        point = await self._vision_locate(
+            "le champ de sélection en haut du dialogue Extrude ('Faces and "
+            "sketch regions to extrude') UNIQUEMENT S'IL EST VIDE, c'est à "
+            "dire s'il affiche encore ce texte de substitution grisé sans "
+            "aucune sélection listée dedans. Réponds found=false si une "
+            "sélection réelle (une face ou une esquisse nommée) y est déjà listée."
+        )
+        return point is not None
+
     async def _extrude(self, *, depth_mm: float | None, remove: bool, through_all: bool) -> None:
         # Valide et quitte l'esquisse (Entrée) avant de pouvoir extruder sa face.
         if self.context is InterfaceContext.SKETCH:
             await self._exit_sketch()
 
-        box = await self._get_graphics_canvas_box()
-        center_x = box["x"] + box["width"] / 2
-        center_y = box["y"] + box["height"] / 2
-
-        # Sélectionne la face de l'esquisse fermée avant d'extruder, en
-        # localisant son point par vision (repli : centre du canvas).
-        await self._click_by_vision(
-            "la face/région fermée de l'esquisse (le rectangle ou le cercle "
-            "dessiné) à sélectionner pour l'extrusion — pas un plan de "
-            "référence Top/Front/Right",
-            (center_x, center_y),
-        )
+        # Sélectionne la face de l'esquisse fermée avant d'extruder.
+        await self._click_sketch_face()
         await self._snapshot("face_selectionnee")
 
         action = ActionType.EXTRUDE_REMOVE if remove else ActionType.EXTRUDE_ADD
         await self._activate_tool(action)
         await self._snapshot("dialogue_extrusion")
+
+        # Filet de sécurité : si la sélection est visiblement vide (le
+        # premier clic a raté), on ferme le dialogue et on retente une
+        # fois avec un point différent, plutôt que de continuer avec une
+        # extrusion sans rien à extruder.
+        if await self._extrude_selection_is_empty():
+            print("[agent_modelisateur] Sélection de face vide détectée, nouvel essai...", file=sys.stderr)
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(UI_SETTLE_DELAY_S)
+            await self._click_sketch_face(
+                " Le premier essai a raté (rien sélectionné) : viser un point "
+                "nettement différent, plus proche d'un coin de la forme."
+            )
+            await self._snapshot("face_selectionnee_2e_essai")
+            await self._activate_tool(action)
+            await self._snapshot("dialogue_extrusion_2e_essai")
 
         if remove:
             # NON VÉRIFIÉ CONTRE L'APP RÉELLE : bascule le dialogue en mode
