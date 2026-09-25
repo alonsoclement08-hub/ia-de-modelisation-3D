@@ -101,23 +101,49 @@ class OnshapeAgent:
 
         await self._dismiss_overlays()
 
-        # Le <canvas> existe très tôt dans le DOM mais reste caché (bounding
-        # box nulle) tant que la vue graphique n'a pas fini son
-        # initialisation. L'attribut data-view-shown, lui, ne passe pas
-        # forcément à "true" de façon fiable : on se base plutôt sur la
-        # taille réellement rendue à l'écran, seul signal garanti.
+        # Onshape a plusieurs <canvas> sur la page (mini-cube d'orientation,
+        # icônes...) : document.querySelector('canvas') attrape le premier
+        # trouvé dans le DOM, pas forcément le grand canvas 3D. On attend
+        # donc qu'AU MOINS UN canvas dépasse une taille plausible pour une
+        # zone de dessin, ce qui filtre les petites icônes.
         await self.page.wait_for_function(
             """
-            () => {
-                const c = document.querySelector('canvas');
-                if (!c) return false;
+            () => Array.from(document.querySelectorAll('canvas')).some(c => {
                 const r = c.getBoundingClientRect();
-                return r.width > 0 && r.height > 0;
-            }
+                return r.width > 200 && r.height > 200;
+            })
             """,
             timeout=90_000,
         )
-        await self.page.locator("canvas").first.click()
+
+        box = await self._get_graphics_canvas_box()
+        await self.page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+    async def _get_graphics_canvas_box(self) -> dict:
+        """Retourne le bounding box du plus grand `<canvas>` de la page.
+
+        Sert de zone de dessin/clic pour toutes les étapes suivantes. On ne
+        peut pas se fier à "le premier <canvas> du DOM" (cf. `open_document`) :
+        on prend systématiquement le plus grand par surface.
+        """
+        box = await self.page.evaluate(
+            """
+            () => {
+                let best = null;
+                for (const c of document.querySelectorAll('canvas')) {
+                    const r = c.getBoundingClientRect();
+                    const area = r.width * r.height;
+                    if (!best || area > best.width * best.height) {
+                        best = { x: r.x, y: r.y, width: r.width, height: r.height };
+                    }
+                }
+                return best;
+            }
+            """
+        )
+        if box is None or box["width"] == 0 or box["height"] == 0:
+            raise ModelisationError("Impossible de localiser le canvas 3D d'Onshape.")
+        return box
 
     async def _dismiss_overlays(self) -> None:
         """Ferme les popups (accueil, cookies, nouveautés) qui peuvent masquer le canvas."""
@@ -164,11 +190,7 @@ class OnshapeAgent:
         await self.page.keyboard.press("r")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
 
-        canvas = self.page.locator("#graphicsCanvas, canvas").first
-        box = await canvas.bounding_box()
-        if box is None:
-            raise ModelisationError("Impossible de localiser le canvas 3D d'Onshape.")
-
+        box = await self._get_graphics_canvas_box()
         center_x = box["x"] + box["width"] / 2
         center_y = box["y"] + box["height"] / 2
 
@@ -198,11 +220,7 @@ class OnshapeAgent:
         await asyncio.sleep(UI_SETTLE_DELAY_S)
 
     async def _dimension_rectangle(self, width_mm: float, height_mm: float) -> None:
-        canvas = self.page.locator("#graphicsCanvas, canvas").first
-        box = await canvas.bounding_box()
-        if box is None:
-            raise ModelisationError("Impossible de localiser le canvas 3D d'Onshape.")
-
+        box = await self._get_graphics_canvas_box()
         center_x = box["x"] + box["width"] / 2
         center_y = box["y"] + box["height"] / 2
 
@@ -226,10 +244,7 @@ class OnshapeAgent:
         await self.page.keyboard.press("Escape")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
 
-        canvas = self.page.locator("#graphicsCanvas, canvas").first
-        box = await canvas.bounding_box()
-        if box is None:
-            raise ModelisationError("Impossible de localiser le canvas 3D d'Onshape.")
+        box = await self._get_graphics_canvas_box()
         center_x = box["x"] + box["width"] / 2
         center_y = box["y"] + box["height"] / 2
 
