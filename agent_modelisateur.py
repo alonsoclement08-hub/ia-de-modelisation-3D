@@ -99,11 +99,28 @@ class OnshapeAgent:
             await asyncio.to_thread(input)
             await self.page.goto(document_url)  # Recharge le document une fois connecté.
 
-        # Le canvas 3D d'Onshape se monte après le reste de l'UI ; on
-        # attend un élément stable de l'espace de travail plutôt qu'un
-        # simple délai fixe.
-        await self.page.wait_for_selector("#graphicsCanvas, canvas", timeout=60_000)
-        await self.page.locator("#graphicsCanvas, canvas").first.click()
+        await self._dismiss_overlays()
+
+        # Le <canvas> existe très tôt dans le DOM mais reste caché tant que
+        # la vue graphique n'a pas fini son initialisation. Onshape le
+        # signale via l'attribut data-view-shown="true" sur ce <canvas> ;
+        # attendre juste sa "visibilité" (comme avant) est insuffisant et
+        # provoque un timeout même quand la page charge normalement.
+        await self.page.wait_for_function(
+            "document.querySelector('canvas')?.getAttribute('data-view-shown') === 'true'",
+            timeout=90_000,
+        )
+        await self.page.locator("canvas").first.click()
+
+    async def _dismiss_overlays(self) -> None:
+        """Ferme les popups (accueil, cookies, nouveautés) qui peuvent masquer le canvas."""
+        for label in ("Got it", "Skip", "Close", "Accept", "OK", "J'ai compris", "Fermer", "Accepter"):
+            button = self.page.get_by_role("button", name=label, exact=False)
+            try:
+                if await button.count() > 0:
+                    await button.first.click(timeout=2_000)
+            except Exception:
+                pass  # Overlay absent ou non cliquable : on continue sans bloquer.
 
     async def _is_login_page(self) -> bool:
         """Détecte si Onshape a redirigé vers l'écran de connexion."""
@@ -278,6 +295,17 @@ async def run(command: CADCommand, document_url: str, headless: bool, user_data_
                 # au moment de l'échec (chargement du document compris),
                 # avant de relayer l'erreur.
                 await page.screenshot(path="agent_modelisateur_error.png")
+                if not headless:
+                    # En mode visible, on laisse la fenêtre ouverte le temps
+                    # d'inspecter la page réelle (DevTools compris) plutôt
+                    # que de la fermer immédiatement dans le `finally`.
+                    print(
+                        "\n[agent_modelisateur] Erreur : capture enregistrée dans "
+                        "agent_modelisateur_error.png. La fenêtre reste ouverte pour "
+                        "inspection — appuyez sur Entrée ici pour la fermer.",
+                        file=sys.stderr,
+                    )
+                    await asyncio.to_thread(input)
                 raise
         finally:
             await context.close()
