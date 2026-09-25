@@ -6,10 +6,16 @@ le rejoue dans Onshape via Playwright, en n'utilisant que des raccourcis
 clavier natifs (aucun clic sur un menu).
 
 Palier 1 : création d'un bloc rectangulaire extrudé.
-    N -> nouvelle esquisse sur le plan Top
-    R -> outil Rectangle par le centre
-    D -> cotation des deux côtés
-    E -> extrusion + validation
+    Shift+S -> nouvelle esquisse sur le plan Top
+    R       -> outil Rectangle par le centre
+    D       -> cotation des deux côtés
+    Shift+E -> extrusion + validation
+
+    NOTE : la demande initiale évoquait N/R/D/E. Vérification faite contre
+    la documentation officielle Onshape (cad.onshape.com/help), les
+    raccourcis réels sont Shift+S (nouvelle esquisse) et Shift+E
+    (extrusion) — 'N' seul correspond à "Normal to" (orientation caméra)
+    et 'E' seul à la contrainte "Equal". R et D, eux, correspondent bien.
 
 Stratégie de cotation (fidèle au workflow CAO classique) :
     1. On dessine le rectangle approximativement (taille en pixels, peu
@@ -90,10 +96,10 @@ class OnshapeAgent:
                 f"Plan '{plane.value}' non encore supporté par l'Agent Modélisateur (Palier 1)."
             )
 
-        await self.page.keyboard.press("n")
+        await self.page.keyboard.press("Shift+S")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
 
-        # Après 'N', Onshape attend la sélection d'un plan de construction.
+        # Après Shift+S, Onshape attend la sélection d'un plan de construction.
         # Le plan Top est cliquable dans l'arbre de fonctions ou directement
         # dans le viewport ; on cible ici l'entrée de l'arbre de features,
         # plus stable que des coordonnées de viewport codées en dur.
@@ -180,7 +186,7 @@ class OnshapeAgent:
         await self.page.mouse.click(center_x, center_y)
         await asyncio.sleep(UI_SETTLE_DELAY_S)
 
-        await self.page.keyboard.press("e")
+        await self.page.keyboard.press("Shift+E")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
 
         # La boîte de dialogue d'extrusion s'ouvre avec le champ de
