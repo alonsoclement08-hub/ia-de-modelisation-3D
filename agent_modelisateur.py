@@ -78,13 +78,40 @@ class OnshapeAgent:
     # -- Cycle de vie -------------------------------------------------
 
     async def open_document(self, document_url: str) -> None:
-        """Navigue vers le document Onshape cible et attend son chargement."""
+        """Navigue vers le document Onshape cible et attend son chargement.
+
+        Sur un profil Chromium tout juste créé, Onshape redirige vers son
+        écran de connexion. On détecte ce cas et on met le script en
+        pause le temps que l'utilisateur se connecte lui-même dans la
+        fenêtre ouverte (le script ne saisit jamais d'identifiants) ;
+        la session est ensuite conservée dans le profil persistant pour
+        les prochains lancements.
+        """
         await self.page.goto(document_url)
+
+        if await self._is_login_page():
+            print(
+                "\n[agent_modelisateur] Connexion Onshape requise : "
+                "connectez-vous manuellement dans la fenêtre Chromium ouverte, "
+                "puis revenez ici et appuyez sur Entrée pour continuer...",
+                file=sys.stderr,
+            )
+            await asyncio.to_thread(input)
+            await self.page.goto(document_url)  # Recharge le document une fois connecté.
+
         # Le canvas 3D d'Onshape se monte après le reste de l'UI ; on
         # attend un élément stable de l'espace de travail plutôt qu'un
         # simple délai fixe.
-        await self.page.wait_for_selector("#graphicsCanvas, canvas", timeout=30_000)
+        await self.page.wait_for_selector("#graphicsCanvas, canvas", timeout=60_000)
         await self.page.locator("#graphicsCanvas, canvas").first.click()
+
+    async def _is_login_page(self) -> bool:
+        """Détecte si Onshape a redirigé vers l'écran de connexion."""
+        url = self.page.url.lower()
+        if "login" in url or "signin" in url:
+            return True
+        # Certains flux affichent un formulaire de connexion sans changer d'URL.
+        return await self.page.locator("input[type='password']").count() > 0
 
     # -- Étape N : nouvelle esquisse -----------------------------------
 
@@ -243,12 +270,13 @@ async def run(command: CADCommand, document_url: str, headless: bool, user_data_
             page = context.pages[0] if context.pages else await context.new_page()
             agent = OnshapeAgent(page=page)
 
-            await agent.open_document(document_url)
             try:
+                await agent.open_document(document_url)
                 await agent.execute(command)
             except Exception:
                 # Capture un instantané pour diagnostiquer l'état de l'UI
-                # au moment de l'échec, avant de relayer l'erreur.
+                # au moment de l'échec (chargement du document compris),
+                # avant de relayer l'erreur.
                 await page.screenshot(path="agent_modelisateur_error.png")
                 raise
         finally:
