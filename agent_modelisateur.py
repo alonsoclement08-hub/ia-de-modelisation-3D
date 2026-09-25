@@ -195,21 +195,18 @@ class OnshapeAgent:
             )
 
     async def _focus_canvas(self) -> None:
-        """Redonne le focus DOM et clavier au canvas 3D avant un raccourci.
+        """Redonne le focus DOM et clavier au canvas 3D avant un raccourci,
+        SANS cliquer dessus (pour ne jamais perturber une sélection en cours).
 
         CORRECTIF issu du test réel : les captures de contrôle ont montré
         des cas où une lettre seule ('d') ne déclenchait pas l'outil
-        correspondant — juste une sélection au clic, comme si la frappe
-        n'atteignait jamais le canvas. Un `<canvas>` n'est pas focusable
-        par défaut en HTML (pas de tabindex), donc un simple clic dessus
-        ne garantit pas que le focus clavier quitte réellement le panneau
-        de propriétés ouvert par l'action précédente. On force le focus
-        DOM explicitement en plus du clic.
+        correspondant. Une première version de ce correctif cliquait au
+        centre du canvas avant chaque raccourci pour forcer le focus —
+        mais ce clic annulait la sélection de face faite juste avant
+        l'extrusion (double-clic au même endroit = désélection), laissant
+        le dialogue Extrude sans rien à extruder. `canvas.focus()` en JS
+        suffit à rediriger le clavier sans toucher à la sélection.
         """
-        box = await self._get_graphics_canvas_box()
-        center_x = box["x"] + box["width"] / 2
-        center_y = box["y"] + box["height"] / 2
-        await self.page.mouse.click(center_x, center_y)
         await self.page.evaluate(
             """
             () => {
