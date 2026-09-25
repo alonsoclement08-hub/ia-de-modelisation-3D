@@ -4,17 +4,20 @@ schemas.py
 Contrat de données partagé entre l'Agent Chercheur et l'Agent Modélisateur.
 
 Centraliser ce contrat dans un module unique garantit que les deux agents
-"parlent" toujours le même langage : le Chercheur produit un objet
-`CADCommand`, le Modélisateur consomme exactement le même objet. Pour le
-Palier 2 (perçages, congés, formes complexes), il suffira d'étendre les
-Enum ci-dessous et le modèle `Dimensions` sans casser la compatibilité
-avec le Palier 1.
+"parlent" toujours le même langage. Deux formats cohabitent :
+
+- `CADCommand` (Palier 1) : une pièce simple, un seul bloc extrudé. Ce
+  modèle n'est plus modifié, pour rester lisible et 100% stable.
+- `CADPlan` (Palier 2) : une séquence ordonnée de `CADStep`, pour les
+  pièces combinant plusieurs opérations (esquisse, perçage, congé...).
+  `agent_modelisateur.py` accepte les deux formats en entrée (voir
+  `load_plan`) : un `command.json` Palier 1 existant continue de
+  fonctionner sans modification.
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,11 +25,18 @@ from pydantic import BaseModel, Field
 class ActionType(str, Enum):
     """Actions CAO que l'Agent Modélisateur sait exécuter.
 
-    Palier 1 : uniquement la création de primitives extrudées.
-    Palier 2 (à venir) : CREATE_HOLE, CREATE_FILLET, CREATE_PATTERN, ...
+    CREATE_PRIMITIVE est le format Palier 1 (une pièce = une action).
+    Les autres valeurs sont les étapes unitaires d'un `CADPlan` (Palier 2).
     """
 
     CREATE_PRIMITIVE = "CREATE_PRIMITIVE"
+
+    CREATE_SKETCH = "CREATE_SKETCH"
+    DRAW_RECTANGLE = "DRAW_RECTANGLE"
+    DRAW_CIRCLE = "DRAW_CIRCLE"
+    EXTRUDE_ADD = "EXTRUDE_ADD"
+    EXTRUDE_REMOVE = "EXTRUDE_REMOVE"
+    APPLY_FILLET = "APPLY_FILLET"
 
 
 class PlaneType(str, Enum):
@@ -40,35 +50,25 @@ class PlaneType(str, Enum):
 class SketchType(str, Enum):
     """Types d'esquisses 2D supportés par l'esquisseur.
 
-    Palier 1 : rectangle uniquement.
-    Palier 2 : ajouter ici CIRCLE, POLYGON, SLOT, etc.
+    Palier 3 potentiel : POLYGON, SLOT, etc.
     """
 
     RECTANGLE = "RECTANGLE"
+    CIRCLE = "CIRCLE"
 
 
 class Dimensions(BaseModel):
-    """Cotes géométriques de la pièce, exprimées en millimètres.
-
-    Les champs `width_mm` / `height_mm` / `extrude_depth_mm` couvrent le
-    Palier 1. Les champs optionnels ci-dessous sont des emplacements
-    réservés pour le Palier 2, afin de ne pas devoir changer la forme du
-    JSON (rétrocompatibilité) quand ces fonctionnalités arriveront.
-    """
+    """Cotes géométriques d'une pièce Palier 1 (bloc rectangulaire extrudé), en mm."""
 
     width_mm: float = Field(..., gt=0, description="Largeur du rectangle (mm)")
     height_mm: float = Field(..., gt=0, description="Hauteur du rectangle (mm)")
     extrude_depth_mm: float = Field(..., gt=0, description="Profondeur d'extrusion (mm)")
 
-    # --- Réservé Palier 2 ---
-    hole_diameter_mm: Optional[float] = Field(default=None, gt=0)
-    fillet_radius_mm: Optional[float] = Field(default=None, gt=0)
-
 
 class CADCommand(BaseModel):
-    """Contrat JSON strict échangé entre les deux agents.
+    """Contrat JSON Palier 1 : une pièce simple, une seule action.
 
-    Exemple (Palier 1) :
+    Exemple :
         {
           "action": "CREATE_PRIMITIVE",
           "plane": "Top",
@@ -85,3 +85,51 @@ class CADCommand(BaseModel):
     plane: PlaneType = PlaneType.TOP
     sketch_type: SketchType
     dimensions: Dimensions
+
+
+class StepParams(BaseModel):
+    """Paramètres numériques d'une étape de `CADPlan`.
+
+    Tous les champs sont optionnels : chaque `ActionType` n'en utilise
+    qu'un sous-ensemble (ex. APPLY_FILLET n'a besoin que de `radius_mm`).
+    Les handlers de l'Agent Modélisateur valident eux-mêmes que les
+    champs requis pour leur action sont bien présents.
+    """
+
+    width_mm: float | None = Field(default=None, gt=0, description="Largeur (DRAW_RECTANGLE)")
+    height_mm: float | None = Field(default=None, gt=0, description="Hauteur (DRAW_RECTANGLE)")
+    diameter_mm: float | None = Field(default=None, gt=0, description="Diamètre (DRAW_CIRCLE)")
+    depth_mm: float | None = Field(default=None, gt=0, description="Profondeur (EXTRUDE_ADD/REMOVE)")
+    through_all: bool = Field(default=False, description="Extrusion traversante (EXTRUDE_REMOVE)")
+    radius_mm: float | None = Field(default=None, gt=0, description="Rayon de congé (APPLY_FILLET)")
+
+
+class CADStep(BaseModel):
+    """Une étape unitaire d'un plan de construction (Palier 2)."""
+
+    action: ActionType
+    plane: PlaneType | None = None
+    sketch_type: SketchType | None = None
+    params: StepParams = Field(default_factory=StepParams)
+
+
+class CADPlan(BaseModel):
+    """Séquence ordonnée d'étapes produite par l'Agent Chercheur pour une pièce combinant
+    plusieurs opérations (ex : plaque + trou + congé).
+
+    Exemple pour "plaque 80x80mm, épaisseur 10mm, trou central 37mm" :
+        {
+          "steps": [
+            {"action": "CREATE_SKETCH", "plane": "Top"},
+            {"action": "DRAW_RECTANGLE", "sketch_type": "RECTANGLE",
+             "params": {"width_mm": 80.0, "height_mm": 80.0}},
+            {"action": "EXTRUDE_ADD", "params": {"depth_mm": 10.0}},
+            {"action": "CREATE_SKETCH", "plane": "Top"},
+            {"action": "DRAW_CIRCLE", "sketch_type": "CIRCLE",
+             "params": {"diameter_mm": 37.0}},
+            {"action": "EXTRUDE_REMOVE", "params": {"through_all": true}}
+          ]
+        }
+    """
+
+    steps: list[CADStep]

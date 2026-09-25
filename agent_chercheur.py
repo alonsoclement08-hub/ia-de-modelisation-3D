@@ -2,14 +2,20 @@
 agent_chercheur.py
 
 Agent Chercheur : traduit une demande en langage naturel (français) en un
-ordre CAO structuré et validé (`schemas.CADCommand`), puis le sérialise en
-JSON pour l'Agent Modélisateur.
+ordre CAO structuré et validé, puis le sérialise en JSON pour l'Agent
+Modélisateur.
 
-Palier 1 : reconnaît uniquement la création d'un bloc rectangulaire extrudé
-sur le plan Top. L'architecture (registre de mots-clés + extracteurs de
-cotes dédiés) est conçue pour qu'ajouter une forme au Palier 2 (cercle,
-perçage...) se limite à enregistrer un nouveau mot-clé et un nouvel
-extracteur, sans toucher au reste du pipeline.
+- `interpret()` (Palier 1) : reconnaît la création d'un bloc rectangulaire
+  extrudé simple et produit une `schemas.CADCommand`. Conservée telle
+  quelle pour compatibilité.
+- `interpret_plan()` (Palier 2) : reconnaît une demande combinant plusieurs
+  opérations (bloc + trou + congé...) et produit une `schemas.CADPlan`
+  (séquence ordonnée d'étapes). C'est la méthode utilisée par la CLI.
+
+L'architecture (registre de mots-clés + extracteurs de cotes dédiés) est
+conçue pour qu'ajouter une nouvelle opération au Palier 3 se limite à
+enregistrer un nouvel extracteur et à l'ajouter dans `interpret_plan`,
+sans toucher au reste du pipeline.
 """
 
 from __future__ import annotations
@@ -21,7 +27,16 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 
-from schemas import CADCommand, Dimensions, PlaneType, SketchType
+from schemas import (
+    ActionType,
+    CADCommand,
+    CADPlan,
+    CADStep,
+    Dimensions,
+    PlaneType,
+    SketchType,
+    StepParams,
+)
 
 
 class InterpretationError(ValueError):
@@ -65,6 +80,15 @@ _RE_LENGTH = re.compile(rf"long(?:ueur)?\s+(?:de\s+)?{_NUM}\s*mm")
 # "2 mm de hauteur" / "2 mm de profondeur" / "2 mm d'epaisseur"
 _RE_EXTRUDE_DEPTH = re.compile(rf"{_NUM}\s*mm\s+d[e']\s*(?:hauteur|profondeur|epaisseur)")
 
+# "epaisseur 10 mm" / "epaisseur de 10 mm" (ordre inverse du pattern ci-dessus)
+_RE_THICKNESS_WORD_FIRST = re.compile(rf"(?:epaisseur|hauteur|profondeur)\s+(?:de\s+)?{_NUM}\s*mm")
+
+# "trou central de 37 mm" / "trou de 37mm" / "percage de 37 mm de diametre"
+_RE_HOLE_DIAMETER = re.compile(rf"trou\w*[^.]*?{_NUM}\s*mm|percage\w*[^.]*?{_NUM}\s*mm")
+
+# "conge de 5 mm" / "arrondi de 5 mm sur les coins"
+_RE_FILLET_RADIUS = re.compile(rf"(?:conge|arrondi)\w*[^.]*?{_NUM}\s*mm")
+
 
 def extract_dimensions(normalized_text: str) -> Dimensions:
     """Extrait largeur / hauteur / profondeur d'extrusion d'un texte normalisé.
@@ -89,7 +113,7 @@ def extract_dimensions(normalized_text: str) -> Dimensions:
         if width_mm is not None and height_mm is None:
             height_mm = width_mm
 
-    depth_match = _RE_EXTRUDE_DEPTH.search(normalized_text)
+    depth_match = _RE_EXTRUDE_DEPTH.search(normalized_text) or _RE_THICKNESS_WORD_FIRST.search(normalized_text)
 
     if width_mm is None or height_mm is None:
         raise InterpretationError(
@@ -105,6 +129,20 @@ def extract_dimensions(normalized_text: str) -> Dimensions:
         height_mm=height_mm,
         extrude_depth_mm=_to_float(depth_match.group(1)),
     )
+
+
+def extract_hole_diameter(normalized_text: str) -> float | None:
+    """Extrait le diamètre d'un trou/perçage mentionné dans la demande (Palier 2)."""
+    match = _RE_HOLE_DIAMETER.search(normalized_text)
+    if not match:
+        return None
+    return _to_float(match.group(1) or match.group(2))
+
+
+def extract_fillet_radius(normalized_text: str) -> float | None:
+    """Extrait le rayon de congé mentionné dans la demande (Palier 2)."""
+    match = _RE_FILLET_RADIUS.search(normalized_text)
+    return _to_float(match.group(1)) if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +193,10 @@ def detect_plane(normalized_text: str) -> PlaneType:
 
 @dataclass
 class AgentChercheur:
-    """Interprète une demande en langage naturel et produit un `CADCommand`."""
+    """Interprète une demande en langage naturel et produit un ordre CAO."""
 
     def interpret(self, request: str) -> CADCommand:
+        """Palier 1 : une pièce simple (bloc rectangulaire extrudé) en une seule `CADCommand`."""
         if not request or not request.strip():
             raise InterpretationError("La demande est vide.")
 
@@ -172,6 +211,49 @@ class AgentChercheur:
             sketch_type=sketch_type,
             dimensions=dimensions,
         )
+
+    def interpret_plan(self, request: str) -> CADPlan:
+        """Palier 2 : une demande combinant plusieurs opérations en une `CADPlan`.
+
+        Construit toujours une base (esquisse + rectangle + extrusion), puis
+        ajoute un trou (esquisse + cercle + extrusion enlèvement) et/ou un
+        congé si la demande les mentionne. Pour ajouter une opération,
+        ajouter son extracteur dédié et les `CADStep` correspondantes ici.
+        """
+        if not request or not request.strip():
+            raise InterpretationError("La demande est vide.")
+
+        normalized_text = _normalize(request)
+
+        sketch_type = detect_sketch_type(normalized_text)
+        plane = detect_plane(normalized_text)
+        base_dims = extract_dimensions(normalized_text)
+
+        steps: list[CADStep] = [
+            CADStep(action=ActionType.CREATE_SKETCH, plane=plane),
+            CADStep(
+                action=ActionType.DRAW_RECTANGLE,
+                sketch_type=sketch_type,
+                params=StepParams(width_mm=base_dims.width_mm, height_mm=base_dims.height_mm),
+            ),
+            CADStep(action=ActionType.EXTRUDE_ADD, params=StepParams(depth_mm=base_dims.extrude_depth_mm)),
+        ]
+
+        if (hole_diameter := extract_hole_diameter(normalized_text)) is not None:
+            steps.append(CADStep(action=ActionType.CREATE_SKETCH, plane=plane))
+            steps.append(
+                CADStep(
+                    action=ActionType.DRAW_CIRCLE,
+                    sketch_type=SketchType.CIRCLE,
+                    params=StepParams(diameter_mm=hole_diameter),
+                )
+            )
+            steps.append(CADStep(action=ActionType.EXTRUDE_REMOVE, params=StepParams(through_all=True)))
+
+        if (fillet_radius := extract_fillet_radius(normalized_text)) is not None:
+            steps.append(CADStep(action=ActionType.APPLY_FILLET, params=StepParams(radius_mm=fillet_radius)))
+
+        return CADPlan(steps=steps)
 
 
 def main() -> None:
@@ -188,18 +270,18 @@ def main() -> None:
 
     agent = AgentChercheur()
     try:
-        command = agent.interpret(args.request)
+        plan = agent.interpret_plan(args.request)
     except InterpretationError as exc:
         print(f"[agent_chercheur] Erreur d'interprétation : {exc}", file=sys.stderr)
         sys.exit(1)
 
-    payload = command.model_dump(mode="json")
+    payload = plan.model_dump(mode="json")
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
     print(json.dumps(payload, indent=2, ensure_ascii=False))
-    print(f"\n[agent_chercheur] Ordre CAO écrit dans {args.output}", file=sys.stderr)
+    print(f"\n[agent_chercheur] Plan CAO ({len(plan.steps)} étape(s)) écrit dans {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":
