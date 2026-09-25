@@ -39,7 +39,7 @@ import argparse
 import asyncio
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, ClassVar
 
@@ -64,6 +64,13 @@ SKETCH_DRAFT_HALF_SIZE_PX = 100
 # arriver avant que le champ de saisie ne soit prêt à les recevoir.
 UI_SETTLE_DELAY_S = 0.4
 
+# Dossier des captures de contrôle prises après chaque étape (Shift+S, R,
+# D, Shift+E). Playwright ne détecte pas les échecs "silencieux" (un clic
+# qui atterrit au bon endroit mais ne déclenche pas l'action attendue) :
+# ces captures sont le seul moyen de vérifier visuellement que chaque
+# étape a réellement eu l'effet voulu dans l'UI Onshape.
+DEBUG_SCREENSHOT_DIR = Path("debug_screenshots")
+
 
 class ModelisationError(RuntimeError):
     """Levée quand une étape de modélisation échoue dans Onshape."""
@@ -74,6 +81,15 @@ class OnshapeAgent:
     """Pilote une page Onshape via des raccourcis clavier pour construire une pièce."""
 
     page: Page
+    _step_counter: int = field(default=0, repr=False)
+
+    async def _snapshot(self, step_name: str) -> None:
+        """Capture un instantané après une étape, pour vérifier visuellement son effet réel."""
+        DEBUG_SCREENSHOT_DIR.mkdir(exist_ok=True)
+        self._step_counter += 1
+        path = DEBUG_SCREENSHOT_DIR / f"{self._step_counter}_{step_name}.png"
+        await self.page.screenshot(path=str(path))
+        print(f"[agent_modelisateur] Capture de contrôle : {path}", file=sys.stderr)
 
     # -- Cycle de vie -------------------------------------------------
 
@@ -175,6 +191,7 @@ class OnshapeAgent:
 
         await self.page.keyboard.press("Shift+S")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("01_apres_shift_s")
 
         # Après Shift+S, Onshape attend la sélection d'un plan de construction.
         # Le plan Top est cliquable dans l'arbre de fonctions ou directement
@@ -183,6 +200,7 @@ class OnshapeAgent:
         top_plane_entry = self.page.get_by_text("Top", exact=True).first
         await top_plane_entry.click()
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("02_plan_top_clique")
 
     # -- Étape R : rectangle par le centre -----------------------------
 
@@ -203,6 +221,7 @@ class OnshapeAgent:
         )
         await self.page.keyboard.press("Escape")  # Sort de l'outil rectangle.
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("03_rectangle_dessine")
 
     # -- Étape D : cotation des deux côtés ------------------------------
 
@@ -236,6 +255,7 @@ class OnshapeAgent:
 
         await self.page.keyboard.press("Escape")  # Sort de l'outil cotation.
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("04_cotation_terminee")
 
     # -- Étape E : extrusion ---------------------------------------------
 
@@ -251,9 +271,11 @@ class OnshapeAgent:
         # Sélectionne la face de l'esquisse fermée avant d'extruder.
         await self.page.mouse.click(center_x, center_y)
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("05_face_selectionnee")
 
         await self.page.keyboard.press("Shift+E")
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("06_dialogue_extrusion")
 
         # La boîte de dialogue d'extrusion s'ouvre avec le champ de
         # profondeur déjà focalisé et son contenu sélectionné : on peut
@@ -261,6 +283,7 @@ class OnshapeAgent:
         await self.page.keyboard.type(str(depth_mm))
         await self.page.keyboard.press("Enter")  # Valide la boîte de dialogue.
         await asyncio.sleep(UI_SETTLE_DELAY_S)
+        await self._snapshot("07_extrusion_validee")
 
     # -- Dispatch ----------------------------------------------------------
 
